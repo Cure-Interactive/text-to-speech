@@ -9,7 +9,7 @@ Features:
 - Paste/type text in a multi-line input box.
 - Select available system voice.
 - Configure speech rate.
-- Speak / Stop controls.
+- Speak / Pause / Stop controls.
 - Persist UI settings to local config.json beside the script.
 
 Dependency:
@@ -19,10 +19,12 @@ Dependency:
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import queue
 import threading
+import re
 import tkinter as tk
 from tkinter import messagebox
 
@@ -35,6 +37,7 @@ APP_USER_MODEL_ID = "CureInteractive.TextToSpeech"
 
 PATH_DIR_SCRIPT = os.path.abspath(os.path.dirname(__file__))
 PATH_CONFIG_JSON = os.path.join(PATH_DIR_SCRIPT, "config.json")
+PATH_LOG_DIR = os.path.join(PATH_DIR_SCRIPT, "_log")
 
 DEFAULT_CONFIG = {
   "window": {
@@ -43,7 +46,7 @@ DEFAULT_CONFIG = {
   },
   "appearance_mode": "System",
   "color_theme": "blue",
-  "speech_rate": 190,
+  "speech_rate": 130,
   "voice_id": "",
   "text": "",
 }
@@ -120,45 +123,60 @@ def set_window_icon(root, ico_path: str, png_path: str) -> None:
     pass
 
 
+def split_text_for_tts(text: str, max_chunk_chars: int = 120) -> list[str]:
+  """
+  Break text into sentence-like chunks so live rate/voice changes can apply
+  between chunks.
+  """
+  raw_parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+  sentence_parts = [p.strip() for p in raw_parts if p and p.strip()]
+  if not sentence_parts:
+    return []
+
+  out: list[str] = []
+  for sentence in sentence_parts:
+    if len(sentence) <= max_chunk_chars:
+      out.append(sentence)
+      continue
+
+    # Hard wrap very long sentences by words so stop/live updates get frequent
+    # checkpoints.
+    words = sentence.split()
+    current = ""
+    for word in words:
+      if not current:
+        current = word
+        continue
+      candidate = f"{current} {word}"
+      if len(candidate) <= max_chunk_chars:
+        current = candidate
+      else:
+        out.append(current)
+        current = word
+    if current:
+      out.append(current)
+
+  return out
+
+
 # =============================================================================
-# TTS Engine (worker-thread usage)
+# TTS Engine
 # =============================================================================
 
 class TtsEngine:
-  def __init__(self):
-    self._engine = pyttsx3.init()
-    self._lock = threading.Lock()
+  @staticmethod
+  def create_engine() -> pyttsx3.Engine:
+    return pyttsx3.init()
 
-  def list_voices(self) -> list[tuple[str, str]]:
-    voices = self._engine.getProperty("voices") or []
+  @staticmethod
+  def list_voices(engine: pyttsx3.Engine) -> list[tuple[str, str]]:
+    voices = engine.getProperty("voices") or []
     out: list[tuple[str, str]] = []
     for v in voices:
       voice_id = getattr(v, "id", "") or ""
       name = getattr(v, "name", "") or voice_id or "Voice"
       out.append((voice_id, name))
     return out
-
-  def speak(self, *, text: str, voice_id: str | None, rate: int) -> None:
-    # Only lock around queue/property mutation. Keep runAndWait unlocked so
-    # Stop can interrupt playback without freezing the GUI thread.
-    with self._lock:
-      try:
-        self._engine.stop()
-      except Exception:
-        pass
-
-      if voice_id:
-        self._engine.setProperty("voice", voice_id)
-      self._engine.setProperty("rate", int(rate))
-      self._engine.say(text)
-
-    self._engine.runAndWait()
-
-  def stop(self) -> None:
-    try:
-      self._engine.stop()
-    except Exception:
-      pass
 
 
 # =============================================================================
@@ -190,10 +208,29 @@ class TextToSpeechApp(ctk.CTk):
     self._tts = TtsEngine()
     self._ui_queue: queue.Queue[tuple[str, str]] = queue.Queue()
     self._speak_thread: threading.Thread | None = None
+    self._state_lock = threading.Lock()
+    self._engine_lock = threading.Lock()
+    self._current_engine: pyttsx3.Engine | None = None
+    self._active_playback_id = 0
+    self._active_stop_event: threading.Event | None = None
+    self._active_action: str | None = None
+    self._active_action_playback_id = 0
+    self._log_file_lock = threading.Lock()
+    self._log_path = self._make_log_path()
+    self._live_rate = clamp_int(self.config_data.get("speech_rate", 130), 80, 300, 130)
+    self._live_voice_id = ""
+    self._paused_source_text = ""
+    self._paused_chunks: list[str] = []
+    self._paused_index = 0
 
-    self.var_rate = tk.IntVar(value=clamp_int(self.config_data.get("speech_rate", 190), 80, 300, 190))
+    self.var_rate = tk.IntVar(value=self._live_rate)
 
-    self.voice_items = self._tts.list_voices()
+    voice_probe_engine = self._tts.create_engine()
+    self.voice_items = self._tts.list_voices(voice_probe_engine)
+    try:
+      voice_probe_engine.stop()
+    except Exception:
+      pass
     self.voice_name_by_id = {voice_id: label for voice_id, label in self.voice_items}
     self.voice_id_by_name = {label: voice_id for voice_id, label in self.voice_items}
 
@@ -203,6 +240,7 @@ class TextToSpeechApp(ctk.CTk):
       default_voice_name = self.voice_items[0][1]
 
     self.var_voice_name = tk.StringVar(value=default_voice_name)
+    self._live_voice_id = self.voice_id_by_name.get(default_voice_name, "")
 
     self._build_ui()
 
@@ -212,6 +250,7 @@ class TextToSpeechApp(ctk.CTk):
 
     self.protocol("WM_DELETE_WINDOW", self._on_close)
     self.after(120, self._poll_ui_queue)
+    self._log("App started.")
 
   def _build_ui(self) -> None:
     pad = {"padx": 14, "pady": 8}
@@ -237,6 +276,7 @@ class TextToSpeechApp(ctk.CTk):
       controls,
       values=voice_values,
       variable=self.var_voice_name,
+      command=self._on_voice_changed,
       dynamic_resizing=False,
       width=340,
     )
@@ -272,16 +312,34 @@ class TextToSpeechApp(ctk.CTk):
     self.btn_speak = ctk.CTkButton(actions, text="Speak", command=self._on_speak_clicked, width=120)
     self.btn_speak.pack(side="left", padx=10, pady=10)
 
+    self.btn_pause = ctk.CTkButton(actions, text="Pause", command=self._on_pause_clicked, width=120)
+    self.btn_pause.pack(side="left", padx=6, pady=10)
+    self.btn_pause.configure(state="disabled")
+
     self.btn_stop = ctk.CTkButton(actions, text="Stop", command=self._on_stop_clicked, width=120)
     self.btn_stop.pack(side="left", padx=6, pady=10)
 
     self.status_label = ctk.CTkLabel(actions, text="Idle")
     self.status_label.pack(side="left", padx=16, pady=10)
 
+    log_wrap = ctk.CTkFrame(self)
+    log_wrap.grid(row=4, column=0, sticky="ew", **pad)
+    log_wrap.grid_columnconfigure(0, weight=1)
+
+    ctk.CTkLabel(log_wrap, text="Log").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+    self.log_text = ctk.CTkTextbox(log_wrap, height=130, wrap="word")
+    self.log_text.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+    self.log_text.configure(state="disabled")
+
   def _on_rate_changed(self, value: float) -> None:
     n = int(value)
     self.var_rate.set(n)
+    self._live_rate = n
     self.rate_value.configure(text=str(n))
+
+  def _on_voice_changed(self, selected_label: str) -> None:
+    self._live_voice_id = self.voice_id_by_name.get((selected_label or "").strip(), "")
+    self._log(f"Voice changed to: {selected_label}")
 
   def _selected_voice_id(self) -> str:
     selected_label = self.var_voice_name.get().strip()
@@ -289,6 +347,7 @@ class TextToSpeechApp(ctk.CTk):
 
   def _set_busy(self, busy: bool, status: str) -> None:
     self.btn_speak.configure(state=("disabled" if busy else "normal"))
+    self.btn_pause.configure(state=("normal" if busy else "disabled"))
     self.status_label.configure(text=status)
 
   def _on_speak_clicked(self) -> None:
@@ -297,27 +356,93 @@ class TextToSpeechApp(ctk.CTk):
       messagebox.showwarning(APP_TITLE, "Paste or type text first.")
       return
 
-    if self._speak_thread and self._speak_thread.is_alive():
-      messagebox.showinfo(APP_TITLE, "Speech is already running. Press Stop first if needed.")
-      return
+    resume_chunks: list[str] | None = None
+    resume_index = 0
+    if self._paused_source_text == text and self._paused_chunks and 0 <= self._paused_index < len(self._paused_chunks):
+      resume_chunks = list(self._paused_chunks)
+      resume_index = int(self._paused_index)
+      self._log(f"Resuming paused playback from chunk {resume_index + 1}/{len(resume_chunks)}.")
+    else:
+      self._clear_pause_state()
 
-    voice_id = self._selected_voice_id()
-    rate = clamp_int(self.var_rate.get(), 80, 300, 190)
-
+    playback_id, stop_event = self._start_new_playback()
     self._set_busy(True, "Speaking...")
+    self._log(f"Speak requested (playback #{playback_id}).")
 
     def _worker() -> None:
+      stopped = False
+      paused = False
+      next_index = resume_index
+      engine: pyttsx3.Engine | None = None
       try:
-        self._tts.speak(text=text, voice_id=voice_id, rate=rate)
-        self._ui_queue.put(("done", "Idle"))
+        engine = self._tts.create_engine()
+        self._set_current_engine(playback_id, engine)
+
+        chunks = resume_chunks if resume_chunks is not None else split_text_for_tts(text)
+        if not chunks:
+          self._ui_queue.put(("warn", "No speakable text found."))
+          return
+
+        for idx in range(resume_index, len(chunks)):
+          chunk = chunks[idx]
+          if stop_event.is_set():
+            stopped = True
+            break
+
+          voice_id, rate = self._current_live_settings()
+          if voice_id:
+            try:
+              engine.setProperty("voice", voice_id)
+            except Exception as e:
+              self._ui_queue.put(("log", f"Voice apply failed: {e}"))
+          try:
+            engine.setProperty("rate", int(rate))
+          except Exception as e:
+            self._ui_queue.put(("log", f"Rate apply failed: {e}"))
+
+          self._ui_queue.put(("log", f"Speaking chunk {idx + 1}/{len(chunks)} (rate={rate})"))
+          next_index = idx
+          engine.say(chunk)
+          engine.runAndWait()
+
+          if stop_event.is_set():
+            stopped = True
+            break
+          next_index = idx + 1
       except Exception as e:
         self._ui_queue.put(("error", str(e)))
+      finally:
+        try:
+          if engine is not None:
+            engine.stop()
+        except Exception:
+          pass
+        self._clear_current_engine(playback_id, engine)
 
-    self._speak_thread = threading.Thread(target=_worker, daemon=True)
+        action = self._consume_action_for_playback(playback_id)
+        if stopped and action == "pause":
+          paused = True
+          self._store_pause_state(text, chunks if 'chunks' in locals() else [], next_index)
+        elif stopped:
+          self._clear_pause_state()
+        else:
+          self._clear_pause_state()
+
+        if self._is_active_playback(playback_id):
+          self._ui_queue.put(("done", ("Paused" if paused else ("Stopped" if stopped else "Idle"))))
+
+        self._ui_queue.put(("log", f"Playback #{playback_id} {'paused' if paused else ('stopped' if stopped else 'finished')}"))
+
+    self._speak_thread = threading.Thread(target=_worker, daemon=True, name=f"tts-playback-{playback_id}")
     self._speak_thread.start()
 
+  def _on_pause_clicked(self) -> None:
+    self._request_stop("Pause button pressed.", action="pause")
+    self._set_busy(False, "Paused")
+
   def _on_stop_clicked(self) -> None:
-    self._tts.stop()
+    self._request_stop("Stop button pressed.", action="stop")
+    self._clear_pause_state()
     self._set_busy(False, "Stopped")
 
   def _poll_ui_queue(self) -> None:
@@ -325,17 +450,23 @@ class TextToSpeechApp(ctk.CTk):
       while True:
         kind, payload = self._ui_queue.get_nowait()
         if kind == "done":
-          self._set_busy(False, payload)
+          self._set_busy(False, str(payload))
         elif kind == "error":
           self._set_busy(False, "Error")
+          self._log(f"Error: {payload}")
           messagebox.showerror(APP_TITLE, payload)
+        elif kind == "warn":
+          self._set_busy(False, "Idle")
+          self._log(f"Warn: {payload}")
+        elif kind == "log":
+          self._log(str(payload))
     except queue.Empty:
       pass
 
     self.after(120, self._poll_ui_queue)
 
   def _on_close(self) -> None:
-    self._tts.stop()
+    self._request_stop("App closing.", action="stop")
     self._save_config()
     self.destroy()
 
@@ -351,11 +482,125 @@ class TextToSpeechApp(ctk.CTk):
 
     cfg = json.loads(json.dumps(self.config_data))
     cfg["window"] = {"width": w, "height": h}
-    cfg["speech_rate"] = clamp_int(self.var_rate.get(), 80, 300, 190)
+    cfg["speech_rate"] = clamp_int(self.var_rate.get(), 80, 300, 130)
     cfg["voice_id"] = self._selected_voice_id()
     cfg["text"] = self.text_input.get("1.0", "end-1c")
 
     _write_json_atomic(PATH_CONFIG_JSON, cfg)
+
+  def _current_live_settings(self) -> tuple[str, int]:
+    return (self._live_voice_id, clamp_int(self._live_rate, 80, 300, 130))
+
+  def _start_new_playback(self) -> tuple[int, threading.Event]:
+    with self._state_lock:
+      old_stop_event = self._active_stop_event
+      self._active_playback_id += 1
+      playback_id = self._active_playback_id
+      new_stop_event = threading.Event()
+      self._active_stop_event = new_stop_event
+      self._active_action = None
+      self._active_action_playback_id = playback_id
+
+    if old_stop_event is not None:
+      old_stop_event.set()
+    old_engine = self._get_current_engine_snapshot()
+    if old_engine is not None:
+      self._stop_engine_async(old_engine)
+    return playback_id, new_stop_event
+
+  def _request_stop(self, reason: str, action: str = "stop") -> None:
+    with self._state_lock:
+      stop_event = self._active_stop_event
+      self._active_action = action
+      self._active_action_playback_id = self._active_playback_id
+    if stop_event is not None:
+      stop_event.set()
+    engine = self._get_current_engine_snapshot()
+    if engine is not None:
+      self._stop_engine_async(engine)
+    self._log(reason)
+
+  def _set_current_engine(self, playback_id: int, engine: pyttsx3.Engine) -> None:
+    if not self._is_active_playback(playback_id):
+      return
+    with self._engine_lock:
+      self._current_engine = engine
+
+  def _clear_current_engine(self, playback_id: int, engine: pyttsx3.Engine | None) -> None:
+    with self._engine_lock:
+      if self._current_engine is engine:
+        self._current_engine = None
+
+  def _stop_current_engine(self) -> None:
+    with self._engine_lock:
+      engine = self._current_engine
+    if engine is None:
+      return
+    try:
+      engine.stop()
+    except Exception as e:
+      self._ui_queue.put(("log", f"Stop warning: {e}"))
+
+  def _get_current_engine_snapshot(self) -> pyttsx3.Engine | None:
+    with self._engine_lock:
+      return self._current_engine
+
+  def _stop_engine_async(self, engine: pyttsx3.Engine) -> None:
+    def _worker() -> None:
+      try:
+        engine.stop()
+      except Exception as e:
+        self._ui_queue.put(("log", f"Stop warning: {e}"))
+
+    t = threading.Thread(target=_worker, daemon=True, name="tts-stop")
+    t.start()
+
+  def _is_active_playback(self, playback_id: int) -> bool:
+    with self._state_lock:
+      return playback_id == self._active_playback_id
+
+  def _consume_action_for_playback(self, playback_id: int) -> str | None:
+    with self._state_lock:
+      if self._active_action_playback_id != playback_id:
+        return None
+      action = self._active_action
+      self._active_action = None
+      return action
+
+  def _store_pause_state(self, source_text: str, chunks: list[str], next_index: int) -> None:
+    self._paused_source_text = source_text
+    self._paused_chunks = list(chunks)
+    self._paused_index = max(0, min(next_index, len(self._paused_chunks)))
+
+  def _clear_pause_state(self) -> None:
+    self._paused_source_text = ""
+    self._paused_chunks = []
+    self._paused_index = 0
+
+  def _make_log_path(self) -> str:
+    os.makedirs(PATH_LOG_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d")
+    return os.path.join(PATH_LOG_DIR, f"text_to_speech_{stamp}.log")
+
+  def _append_log_text(self, line: str) -> None:
+    try:
+      self.log_text.configure(state="normal")
+      self.log_text.insert("end", line + "\n")
+      self.log_text.see("end")
+      self.log_text.configure(state="disabled")
+    except Exception:
+      pass
+
+  def _write_log_file(self, line: str) -> None:
+    with self._log_file_lock:
+      with open(self._log_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+  def _log(self, message: str) -> None:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {message}"
+    self._append_log_text(line)
+    self._write_log_file(line)
 
 
 def main() -> int:
