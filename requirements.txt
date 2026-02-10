@@ -1,0 +1,6 @@
+﻿customtkinter>=5.2.2
+pyttsx3>=2.90
+
+# Windows-only runtime helpers used by pyttsx3/SAPI in some environments.
+comtypes>=1.2.0; platform_system == "Windows"
+pywin32>=306; platform_system == "Windows"
