@@ -1,6 +1,12 @@
 # Text To Speech
 
-Desktop text-to-speech app using local system voices.
+Highly experimental desktop text-to-speech app using local system voices.
+
+## Beta Status
+
+This project is in a high-beta state and should not be expected to work out of the box. Its current implementation depends on local operating-system speech support through `pyttsx3`, and that stack can fail or behave inconsistently depending on installed voices, audio devices, platform speech drivers, and environment setup.
+
+Use this repo as a prototype or development target, not as a finished utility.
 
 ## Requirements
 
@@ -29,11 +35,11 @@ On Linux or macOS, activate the virtual environment with `source .venv/bin/activ
 ## Run
 
 ```bash
-python text_to_speech.py
+python text-to-speech.py
 ```
 
 ## Usage
 
 Paste text, choose a voice and rate, then use Speak, Pause, and Stop controls.
 
-See `wiki.md` for troubleshooting notes.
+If it does not speak, that is currently expected on some systems. See `wiki.md` for limitations and troubleshooting notes.

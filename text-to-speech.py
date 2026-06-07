@@ -32,7 +32,7 @@ import customtkinter as ctk
 import pyttsx3
 
 
-APP_TITLE = "Text To Speech - Cure Interactive"
+APP_TITLE = "Text To Speech Beta - Cure Interactive"
 APP_USER_MODEL_ID = "CureInteractive.TextToSpeech"
 
 PATH_DIR_SCRIPT = os.path.abspath(os.path.dirname(__file__))
@@ -256,17 +256,26 @@ class TextToSpeechApp(ctk.CTk):
     pad = {"padx": 14, "pady": 8}
 
     self.grid_columnconfigure(0, weight=1)
-    self.grid_rowconfigure(2, weight=1)
+    self.grid_rowconfigure(3, weight=1)
 
     header = ctk.CTkLabel(
       self,
-      text="Paste text and press Speak",
+      text="Text To Speech Beta",
       font=ctk.CTkFont(size=20, weight="bold"),
     )
     header.grid(row=0, column=0, sticky="w", **pad)
 
+    beta_note = ctk.CTkLabel(
+      self,
+      text="Highly experimental: may not work out of the box because it depends on local OS voices, audio devices, and pyttsx3 platform support.",
+      anchor="w",
+      justify="left",
+      wraplength=900,
+    )
+    beta_note.grid(row=1, column=0, sticky="ew", **pad)
+
     controls = ctk.CTkFrame(self)
-    controls.grid(row=1, column=0, sticky="ew", **pad)
+    controls.grid(row=2, column=0, sticky="ew", **pad)
     controls.grid_columnconfigure(1, weight=1)
 
     ctk.CTkLabel(controls, text="Voice").grid(row=0, column=0, padx=10, pady=10, sticky="w")
@@ -299,7 +308,7 @@ class TextToSpeechApp(ctk.CTk):
     self.rate_value.grid(row=0, column=4, padx=(0, 10), pady=10, sticky="w")
 
     text_wrap = ctk.CTkFrame(self)
-    text_wrap.grid(row=2, column=0, sticky="nsew", **pad)
+    text_wrap.grid(row=3, column=0, sticky="nsew", **pad)
     text_wrap.grid_columnconfigure(0, weight=1)
     text_wrap.grid_rowconfigure(0, weight=1)
 
@@ -307,7 +316,7 @@ class TextToSpeechApp(ctk.CTk):
     self.text_input.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
     actions = ctk.CTkFrame(self)
-    actions.grid(row=3, column=0, sticky="ew", **pad)
+    actions.grid(row=4, column=0, sticky="ew", **pad)
 
     self.btn_speak = ctk.CTkButton(actions, text="Speak", command=self._on_speak_clicked, width=120)
     self.btn_speak.pack(side="left", padx=10, pady=10)
@@ -323,7 +332,7 @@ class TextToSpeechApp(ctk.CTk):
     self.status_label.pack(side="left", padx=16, pady=10)
 
     log_wrap = ctk.CTkFrame(self)
-    log_wrap.grid(row=4, column=0, sticky="ew", **pad)
+    log_wrap.grid(row=5, column=0, sticky="ew", **pad)
     log_wrap.grid_columnconfigure(0, weight=1)
 
     ctk.CTkLabel(log_wrap, text="Log").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
