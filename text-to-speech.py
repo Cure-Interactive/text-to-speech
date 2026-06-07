@@ -32,7 +32,7 @@ import customtkinter as ctk
 import pyttsx3
 
 
-APP_TITLE = "Text To Speech Beta - Cure Interactive"
+APP_TITLE = "Text To Speech - Cure Interactive"
 APP_USER_MODEL_ID = "CureInteractive.TextToSpeech"
 
 PATH_DIR_SCRIPT = os.path.abspath(os.path.dirname(__file__))
@@ -260,7 +260,7 @@ class TextToSpeechApp(ctk.CTk):
 
     header = ctk.CTkLabel(
       self,
-      text="Text To Speech Beta",
+      text="Text To Speech",
       font=ctk.CTkFont(size=20, weight="bold"),
     )
     header.grid(row=0, column=0, sticky="w", **pad)
